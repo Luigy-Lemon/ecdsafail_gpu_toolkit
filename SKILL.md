@@ -46,14 +46,16 @@ To switch GPUs later (e.g. the user gives a new box), just re-run `init-remote`/
    uncontested; comparator bits are small (~144–516). See `docs/levers.md`.
 2. **Hunt.** `./island.sh hunt <CFG> <START> <N>` (e.g. `... DIALOG_GCD_ACTIVE_ITERATIONS=258
    1 2000000`). It measures, dumps, GPU-searches, and quantum-confirms candidates, printing
-   `CLEAN nonce=... score=...` for any fully-0/0/0 island. If none, search a larger range
-   (rarer islands need more nonces; lower active_iterations = rarer).
-3. **Bake + submit ONLY a confirmed island.** Use `./island.sh bake <KEY> <VAL> DIALOG_TAIL_NONCE
+   `CLEAN nonce=... score=...` for any fully-0/0/0 island. If none, search a larger range.
+3. **Dashboard (Optional Visual Search).** If the user wants to visually monitor a search in real-time, they can run:
+   `./island.sh dashboard <STATE_FILE> <START> <N>`
+   This launches a curses-based TUI showing total progress, elapsed/ETA times, multi-GPU utilization, speeds, and a list of found candidates.
+4. **Bake + submit ONLY a confirmed island.** Use `./island.sh bake <KEY> <VAL> DIALOG_TAIL_NONCE
    <nonce>` — it edits `mod.rs` CRLF-safely (NEVER use a normal file-edit tool on mod.rs; it
    corrupts CRLF and breaks promotion), shows the diff (must be exactly your lines), and runs
    `ecdsafail run`. Then in `$CHALLENGE`: `ecdsafail submit --note-file <note> --model <m>
    --claimed-score <score>`. Watch `ecdsafail submissions` until `promoted`.
-4. **Stay on the frontier.** Periodically `cd $CHALLENGE && ecdsafail benchmark` / `submissions`.
+5. **Stay on the frontier.** Periodically `cd $CHALLENGE && ecdsafail benchmark` / `submissions`.
    If someone else takes the lead, `ecdsafail sync --force`, re-`install`, re-validate the port,
    and re-run measure→hunt on the new base (apply your lever idea on top of their base).
 
@@ -62,3 +64,4 @@ To switch GPUs later (e.g. the user gives a new box), just re-run `init-remote`/
 - Confirm `ecdsafail run` == leaderboard after every `install`/`sync` (stale-binary trap).
 - Only submit if the confirmed score strictly beats the current best.
 - Bake with `bake`/`perl` only. Verify the `git diff` is exactly the changed config lines.
+

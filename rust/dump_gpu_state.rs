@@ -169,7 +169,11 @@ fn main() {
     let ops = point_add::build();
     let n_ops = ops.len();
     assert!(n_ops > 96);
-    let (_q, _b, _r, regs) = analyze_ops(ops.iter());
+    let (qubits, _b, _r, regs) = analyze_ops(ops.iter());
+    let mut ccx = 0usize;
+    for op in &ops {
+        if op.kind == quantum_ecc::circuit::OperationType::CCX { ccx += 1; }
+    }
     let tx0 = match regs[0][0] { QubitOrBit::Qubit(q) => q.0, _ => panic!("reg0[0]") };
     let tx1 = match regs[0][1] { QubitOrBit::Qubit(q) => q.0, _ => panic!("reg0[1]") };
 
@@ -285,6 +289,8 @@ fn main() {
     w64(&mut f, probe);
     wu256(&mut f, k1);
     wu256(&mut f, k2);
+    let score_str = format!("\nSCORE_TARGET: Qubits={} Toffoli={} Score={}\n", qubits, ccx, qubits * (ccx as u64));
+    f.write_all(score_str.as_bytes()).unwrap();
     f.flush().unwrap();
     eprintln!("wrote {} ({} bytes header+arrays+comb)", path, "?");
     eprintln!("DONE");

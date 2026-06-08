@@ -137,24 +137,36 @@ cd $CHALLENGE && ecdsafail submit --note-file note.md --model "..." --claimed-sc
 | 2. pick a lever | `./island.sh measure DIALOG_GCD_ACTIVE_ITERATIONS=258` | print exact Toffoli (CCX) for baseline vs the tighter config → `Δ × peak` = your score win |
 | 3. build kernel | `./island.sh build` | `nvcc` the kernel (local, or scp+build on your remote box) |
 | 4. dump | `./island.sh dump DIALOG_GCD_ACTIVE_ITERATIONS=258 s.bin` | encode the GCD filter+comb+prefix for that config |
-| 5. search | `./island.sh search s.bin 1 2000000` | GPU-screen 2M nonces → `CLEAN nonce=...` candidates |
+| 5. search / TUI | `./island.sh search s.bin 1 2000000`<br>OR `./island.sh dashboard s.bin 1 2000000` | GPU-screen 2M nonces → `CLEAN nonce=...` candidates (dashboard provides a live multi-GPU curses TUI dashboard) |
 | 6. validate | `./island.sh validate DIALOG_GCD_ACTIVE_ITERATIONS=258 <n>...` | quantum-confirm 0/0/0 + print score |
 | 7. bake | `./island.sh bake DIALOG_GCD_ACTIVE_ITERATIONS 258 DIALOG_TAIL_NONCE <n>` | CRLF-safe edit + `ecdsafail run` |
 | 8. submit | `ecdsafail submit ...` | (in the challenge repo) |
 
 `./island.sh hunt CFG START N` chains steps 2/4/5/6. See `examples/walkthrough.md`.
 
+### Interactive TUI Dashboard
+For a real-time terminal visualizer of the GPU search progress, you can use the `dashboard` command instead of `search`:
+```bash
+./island.sh dashboard s.bin 1 2000000
+```
+This launches a Python-based curses dashboard that monitors the search. It displays:
+- **Target Metrics**: Dynamically parsed from the `state.bin` file (Qubits, Toffoli count, and target Score).
+- **Progress & Performance**: Total search progress bar, elapsed time, real-time ETA, and overall speed (nonces/second).
+- **Multi-GPU Statistics**: Real-time status for each GPU (device model name, utilization, progress, speed, and candidate nonces found).
+- **Accumulated Candidates**: A clean visual list of found `CLEAN` nonces.
+
 ### Local vs remote GPU
-`init-local` / `init-remote` set this up for you. In remote mode, `build`/`search`/`doctor`
+`init-local` / `init-remote` set this up for you. In remote mode, `build`/`search`/`dashboard`/`doctor`
 automatically `scp` the kernel + runtime scripts + the (tiny, ~515 KB) state dump into a
 working dir under the remote home (`~/.ecdsafail_island`, so it works for `ubuntu@`, `root@`,
 any user) and run over SSH; the Rust steps (`dump`/`validate`, which need the challenge repo)
 stay on your laptop. You keep the repo + `ecdsafail` CLI local and rent GPUs only for the
 search. Arch is auto-detected on the remote, so you don't need to know the card's `sm_XX`.
 
-**Long unattended searches:** an `init`+`search` over millions of nonces holds the SSH
+**Long unattended searches:** an `init`+`search` (or `dashboard`) over millions of nonces holds the SSH
 connection open for the duration. For multi-hour runs, wrap the node-side search in `tmux`/
 `screen` (or split the range and run several `./island.sh search` calls).
+
 
 ---
 

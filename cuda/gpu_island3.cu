@@ -302,9 +302,37 @@ __device__ __forceinline__ void u_shr(const u32 a[8], u32 r[8], int n){
     int wsh=n>>5,bsh=n&31;
     for(int i=0;i<8;i++){u32 lo=(i+wsh<8)?a[i+wsh]:0; u32 hi=(i+wsh+1<8)?a[i+wsh+1]:0; r[i]=bsh?((lo>>bsh)|(hi<<(32-bsh))):lo;}
 }
-__device__ __forceinline__ void u_shr1(u32 a[8]){ for(int i=0;i<8;i++){u32 hi=(i+1<8)?a[i+1]:0; a[i]=(a[i]>>1)|(hi<<31);} }
+__device__ __forceinline__ void u_shr1(u32 a[8]){
+    asm volatile (
+        "shf.r.clamp.b32 %0, %0, %1, 1;\n\t"
+        "shf.r.clamp.b32 %1, %1, %2, 1;\n\t"
+        "shf.r.clamp.b32 %2, %2, %3, 1;\n\t"
+        "shf.r.clamp.b32 %3, %3, %4, 1;\n\t"
+        "shf.r.clamp.b32 %4, %4, %5, 1;\n\t"
+        "shf.r.clamp.b32 %5, %5, %6, 1;\n\t"
+        "shf.r.clamp.b32 %6, %6, %7, 1;\n\t"
+        "shr.u32         %7, %7, 1;\n\t"
+        : "+r"(a[0]), "+r"(a[1]), "+r"(a[2]), "+r"(a[3]),
+          "+r"(a[4]), "+r"(a[5]), "+r"(a[6]), "+r"(a[7])
+    );
+}
 __device__ __forceinline__ void u_sub(const u32 a[8], const u32 b[8], u32 r[8]){
-    u64 br=0; for(int i=0;i<8;i++){u64 d=(u64)a[i]-b[i]-br; r[i]=(u32)d; br=(d>>63)&1;}
+    asm volatile (
+        "sub.cc.u32 %0, %8, %16;\n\t"
+        "subc.cc.u32 %1, %9, %17;\n\t"
+        "subc.cc.u32 %2, %10, %18;\n\t"
+        "subc.cc.u32 %3, %11, %19;\n\t"
+        "subc.cc.u32 %4, %12, %20;\n\t"
+        "subc.cc.u32 %5, %13, %21;\n\t"
+        "subc.cc.u32 %6, %14, %22;\n\t"
+        "subc.u32    %7, %15, %23;\n\t"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]),
+          "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
+          "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]),
+          "r"(b[4]), "r"(b[5]), "r"(b[6]), "r"(b[7])
+    );
 }
 __device__ __forceinline__ void u_swap(u32 a[8], u32 b[8]){ for(int i=0;i<8;i++){u32 t=a[i];a[i]=b[i];b[i]=t;} }
 __device__ __forceinline__ void shift_right_active(u32 v[8], int aw){
@@ -351,13 +379,36 @@ __device__ bool truncated_gcd_step(u32 u[8], u32 v[8], int step){
     shift_right_active(v,aw); if(d_k2&&!d_k2f0){if(!u_bit(v,0)) shift_right_active(v,aw);}
     return false;
 }
+__device__ unsigned int d_best_score = 0;
+__device__ unsigned long long d_best_nonce = 0;
+
+__device__ void update_best_candidate(u64 nonce, u32 score) {
+    u32 current_best = d_best_score;
+    while (score > current_best) {
+        u32 old = atomicCAS(&d_best_score, current_best, score);
+        if (old == current_best) {
+            d_best_nonce = nonce;
+            break;
+        }
+        current_best = old;
+    }
+}
+
 __device__ __constant__ u32 d_P[8];
-__device__ bool check_gcd_factor(const u32 factor[8]){
-    if(isZero(factor)) return false;
+
+__device__ bool check_gcd_factor_score(const u32 factor[8], int& out_score){
+    if(isZero(factor)) { out_score = 0; return false; }
     int steps=full_gcd_steps_until_zero(d_P,factor,d_active_iters+1);
-    if(steps>d_active_iters) return false;
+    if(steps>d_active_iters) { out_score = 0; return false; }
     u32 u[8],v[8]; cpy(u,d_P); cpy(v,factor);
-    for(int step=0;step<d_active_iters;step++){if(truncated_gcd_step(u,v,step)) return false;}
+    int step = 0;
+    for(;step<d_active_iters;step++){
+        if(truncated_gcd_step(u,v,step)) {
+            out_score = step;
+            return false;
+        }
+    }
+    out_score = d_active_iters;
     return true;
 }
 
@@ -603,17 +654,27 @@ void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list, int max_o
             }
             
             int local_hard_flag = 0;
+            u32 score = 0;
             if(!skip){
                 u32 dx[8]; submod_p(tx, ox, dx);
                 if(do_inst){
                     int rej = check_gcd_factor_inst(dx, 0);
                     if(rej){ local_hard_flag = 1; atomicAdd((unsigned long long*)&d_rej->first_dx, 1ULL); }
                 } else {
-                    if(!check_gcd_factor(dx)) local_hard_flag = 1;
+                    int dx_score = 0;
+                    if(!check_gcd_factor_score(dx, dx_score)){
+                        local_hard_flag = 1;
+                        score = dx_score;
+                    } else {
+                        score = d_active_iters;
+                    }
                 }
             }
             
-            if(local_hard_flag) hard_flag = 1;
+            if(local_hard_flag){
+                if(!do_inst && score > 0) update_best_candidate(nonce, score);
+                hard_flag = 1;
+            }
             __syncthreads();
             if(hard_flag) break;
             
@@ -635,12 +696,25 @@ void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list, int max_o
                         int rej = check_gcd_factor_inst(c, 1);
                         if(rej){ local_hard_flag = 1; atomicAdd((unsigned long long*)&d_rej->first_c, 1ULL); }
                     } else {
-                        if(!check_gcd_factor(c)) local_hard_flag = 1;
+                        int c_score = 0;
+                        if(!check_gcd_factor_score(c, c_score)){
+                            local_hard_flag = 1;
+                            score = d_active_iters + c_score;
+                        } else {
+                            score = 2 * d_active_iters;
+                        }
                     }
+                } else {
+                    score = 2 * d_active_iters;
                 }
             }
             
-            if(local_hard_flag) hard_flag = 1;
+            if(local_hard_flag){
+                if(!do_inst && score > 0) update_best_candidate(nonce, score);
+                hard_flag = 1;
+            } else if (!skip) {
+                if(!do_inst) update_best_candidate(nonce, score);
+            }
             __syncthreads();
         }
 
@@ -669,8 +743,250 @@ __global__ void probe_kernel3(u64 nonce, u32* out){
 // ================= host =================
 #include <cstdlib>
 #include <cstring>
+#include <sys/time.h>
+#include <unistd.h>
+#include <vector>
+#include <string>
+#include <thread>
+#include <atomic>
+#include <mutex>
+
+static double get_sec() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec * 1e-6;
+}
+
 static u64 rd64(FILE*f){ u64 v; fread(&v,8,1,f); return v; }
 static u32 rd32(FILE*f){ u32 v; fread(&v,4,1,f); return v; }
+
+static std::mutex log_mutex;
+static std::mutex rej_mutex;
+static RejCounters global_rc = {};
+
+struct SharedJob {
+    u64 start_nonce;
+    u64 total_count;
+    u64 chunk_sz;
+    std::atomic<u64> next_offset;
+    std::atomic<u32> total_candidates;
+    double t_start;
+    bool do_inst;
+    int blocks;
+    
+    // Constant values read from state file
+    u64 n_ops; u64 tx0; u64 tx1; u32 base_pt; u32 odd_u; u32 k2; u32 k2f0; u32 ai; u32 cbits;
+    int aw[402]; int cb[402]; int bw[402];
+    u64 base_st[25];
+    u32 comb[32*256*16];
+    
+    std::mutex cand_mutex;
+};
+
+static int get_physical_gpu_id(int dev_id) {
+    const char* cvd = getenv("CUDA_VISIBLE_DEVICES");
+    if (!cvd || strlen(cvd) == 0) {
+        return dev_id;
+    }
+    std::vector<int> devs;
+    std::string s(cvd);
+    size_t pos = 0;
+    while ((pos = s.find(',')) != std::string::npos) {
+        std::string token = s.substr(0, pos);
+        try {
+            devs.push_back(std::stoi(token));
+        } catch (...) {}
+        s.erase(0, pos + 1);
+    }
+    if (!s.empty()) {
+        try {
+            devs.push_back(std::stoi(s));
+        } catch (...) {}
+    }
+    if (dev_id >= 0 && dev_id < (int)devs.size()) {
+        return devs[dev_id];
+    }
+    return dev_id;
+}
+
+void gpu_worker_thread(int dev_id, int logical_gpu_id, SharedJob* job) {
+    if (cudaSetDevice(dev_id) != cudaSuccess) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        printf("GPU[%d] Failed to set device %d\n", logical_gpu_id, dev_id);
+        return;
+    }
+    
+    // Copy constants to this device
+    u32 Phost[8]={0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
+    cudaMemcpyToSymbol(d_P, Phost, 32);
+    int iodd=job->odd_u, ik2=job->k2, ik2f0=job->k2f0, iai=job->ai, icb=job->cbits;
+    cudaMemcpyToSymbol(d_odd_u, &iodd, 4); cudaMemcpyToSymbol(d_k2, &ik2, 4);
+    cudaMemcpyToSymbol(d_k2f0, &ik2f0, 4); cudaMemcpyToSymbol(d_active_iters, &iai, 4);
+    cudaMemcpyToSymbol(d_compare_bits, &icb, 4);
+    cudaMemcpyToSymbol(d_aw, job->aw, sizeof(job->aw)); 
+    cudaMemcpyToSymbol(d_cb, job->cb, sizeof(job->cb)); 
+    cudaMemcpyToSymbol(d_bw, job->bw, sizeof(job->bw));
+    cudaMemcpyToSymbol(d_base_st, job->base_st, 200); 
+    cudaMemcpyToSymbol(d_base_pt, &job->base_pt, 4);
+    u64 utx0=job->tx0, utx1=job->tx1; 
+    cudaMemcpyToSymbol(d_tx0, &utx0, 8); 
+    cudaMemcpyToSymbol(d_tx1, &utx1, 8);
+    
+    u32* dcomb; 
+    cudaMalloc(&dcomb, sizeof(job->comb)); 
+    cudaMemcpy(dcomb, job->comb, sizeof(job->comb), cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_comb, &dcomb, sizeof(dcomb));
+    
+    u32* dcnt; cudaMalloc(&dcnt, 4); cudaMemset(dcnt, 0, 4);
+    const int MAXOUT=4096; 
+    u64* dlist; cudaMalloc(&dlist, MAXOUT*8);
+    
+    unsigned long long zero_counter = 0;
+    
+    RejCounters* d_rc=NULL;
+    if(job->do_inst){
+        cudaMalloc(&d_rc, sizeof(RejCounters)); cudaMemset(d_rc, 0, sizeof(RejCounters));
+        cudaMemcpyToSymbol(d_rej, &d_rc, sizeof(d_rc));
+    }
+    
+    cudaStream_t search_stream;
+    cudaStreamCreateWithFlags(&search_stream, cudaStreamNonBlocking);
+    cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
+    
+    cudaStream_t info_stream;
+    cudaStreamCreateWithFlags(&info_stream, cudaStreamNonBlocking);
+    unsigned long long* h_progress; cudaMallocHost(&h_progress, sizeof(unsigned long long));
+    u32* h_cnt; cudaMallocHost(&h_cnt, sizeof(u32));
+    
+    u32 last_cnt = 0;
+    u64 total_done_on_this_gpu = 0;
+    unsigned int last_printed_best_score = 0;
+    
+    int blocks = job->blocks;
+    if (blocks == 0) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, dev_id) == cudaSuccess) {
+            blocks = prop.multiProcessorCount * 4;
+        } else {
+            blocks = 72;
+        }
+    }
+
+    cudaEventRecord(t0, search_stream);
+    
+    while(true) {
+        // Dynamic load balancing: fetch next chunk
+        u64 offset = job->next_offset.fetch_add(job->chunk_sz);
+        if(offset >= job->total_count) break;
+        
+        u64 c = (job->total_count - offset < job->chunk_sz) ? (job->total_count - offset) : job->chunk_sz;
+        
+        // Reset dynamic global counter for this chunk launch
+        cudaMemcpyToSymbol(d_global_counter, &zero_counter, 8);
+        
+        search_kernel3<<<blocks, W, 0, search_stream>>>(job->start_nonce + offset, c, dcnt, dlist, MAXOUT, job->do_inst?1:0);
+        cudaEventRecord(t1, search_stream);
+        
+        bool is_done = false;
+        while(!is_done){
+            cudaError_t err = cudaEventQuery(t1);
+            if(err == cudaSuccess){
+                is_done = true;
+            } else if(err != cudaErrorNotReady){
+                std::lock_guard<std::mutex> lock(log_mutex);
+                printf("GPU[%d] search err %s\n", logical_gpu_id, cudaGetErrorString(err));
+                return;
+            }
+            
+            unsigned int current_best_score = 0;
+            unsigned long long current_best_nonce = 0;
+            cudaMemcpyFromSymbolAsync(h_progress, d_global_counter, 8, 0, cudaMemcpyDeviceToHost, info_stream);
+            cudaMemcpyAsync(h_cnt, dcnt, 4, cudaMemcpyDeviceToHost, info_stream);
+            cudaMemcpyFromSymbolAsync(&current_best_score, d_best_score, 4, 0, cudaMemcpyDeviceToHost, info_stream);
+            cudaMemcpyFromSymbolAsync(&current_best_nonce, d_best_nonce, 8, 0, cudaMemcpyDeviceToHost, info_stream);
+            cudaStreamSynchronize(info_stream);
+            
+            unsigned long long progress = *h_progress;
+            if(is_done || progress > c) progress = c;
+            
+            if (current_best_score > last_printed_best_score) {
+                std::lock_guard<std::mutex> lock(log_mutex);
+                fprintf(stderr, "GPU[%d] BEST nonce=%llu score=%u\n", logical_gpu_id, current_best_nonce, current_best_score);
+                fflush(stderr);
+                last_printed_best_score = current_best_score;
+            }
+            
+            // Query clean nonces
+            u32 current_cnt = *h_cnt;
+            if(current_cnt > last_cnt){
+                u64 new_nonces[MAXOUT];
+                cudaMemcpy(new_nonces, dlist, (current_cnt < MAXOUT ? current_cnt : MAXOUT) * 8, cudaMemcpyDeviceToHost);
+                {
+                    std::lock_guard<std::mutex> lock(job->cand_mutex);
+                    for(u32 i = last_cnt; i < current_cnt && i < MAXOUT; i++){
+                        printf("CLEAN nonce=%llu\n", (unsigned long long)new_nonces[i]);
+                        fprintf(stderr, "CLEAN nonce=%llu\n", (unsigned long long)new_nonces[i]);
+                    }
+                    fflush(stdout);
+                    fflush(stderr);
+                }
+                last_cnt = current_cnt;
+            }
+            
+            double elapsed = get_sec() - job->t_start;
+            u64 current_gpu_progress = total_done_on_this_gpu + progress;
+            u64 speed = elapsed > 0.01 ? (u64)(current_gpu_progress / elapsed) : 0;
+            
+            {
+                std::lock_guard<std::mutex> lock(log_mutex);
+                // Report to TUI: We use logical_gpu_id, and report progress done on this GPU, with total=global_count
+                fprintf(stderr, "GPU[%d] OFFSET=0: PROGRESS done=%llu total=%llu speed=%llu candidates=%u\n",
+                    logical_gpu_id, current_gpu_progress, job->total_count, speed, current_cnt);
+                fflush(stderr);
+            }
+            
+            if(!is_done){
+                usleep(200000);
+            }
+        }
+        total_done_on_this_gpu += c;
+    }
+    
+    // Print final progress update
+    job->total_candidates.fetch_add(last_cnt);
+    
+    if (job->do_inst && d_rc) {
+        RejCounters local_rc = {};
+        cudaMemcpy(&local_rc, d_rc, sizeof(RejCounters), cudaMemcpyDeviceToHost);
+        
+        std::lock_guard<std::mutex> lock(rej_mutex);
+        global_rc.dx_zero += local_rc.dx_zero;
+        global_rc.dx_noconv += local_rc.dx_noconv;
+        global_rc.dx_width += local_rc.dx_width;
+        global_rc.c_zero += local_rc.c_zero;
+        global_rc.c_noconv += local_rc.c_noconv;
+        global_rc.c_width += local_rc.c_width;
+        global_rc.nonces_launched += local_rc.nonces_launched;
+        global_rc.nonces_clean += local_rc.nonces_clean;
+        if (local_rc.first_dx > 0 && (global_rc.first_dx == 0 || local_rc.first_dx < global_rc.first_dx)) {
+            global_rc.first_dx = local_rc.first_dx;
+        }
+        if (local_rc.first_c > 0 && (global_rc.first_c == 0 || local_rc.first_c < global_rc.first_c)) {
+            global_rc.first_c = local_rc.first_c;
+        }
+    }
+    
+    cudaFree(dcomb);
+    cudaFree(dcnt);
+    cudaFree(dlist);
+    if(d_rc) cudaFree(d_rc);
+    cudaFreeHost(h_progress);
+    cudaFreeHost(h_cnt);
+    cudaStreamDestroy(info_stream);
+    cudaStreamDestroy(search_stream);
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+}
 
 int main(int argc, char** argv){
     const char* dump = getenv("GPU_STATE"); if(!dump) dump="/tmp/gpu_state.bin";
@@ -682,84 +998,109 @@ int main(int argc, char** argv){
     u32 magic=rd32(f); if(magic!=0x47505531){ printf("bad magic %08x\n",magic); return 1; }
     u64 n_ops=rd64(f); u64 tx0=rd64(f), tx1=rd64(f);
     u32 base_pt=rd32(f);
-    u64 base_st[25]; for(int i=0;i<25;i++) base_st[i]=rd64(f);
-    u32 odd_u=rd32(f), k2=rd32(f), k2f0=rd32(f), ai=rd32(f), cbits=rd32(f);
-    int aw[402],cb[402],bw[402]; for(int i=0;i<402;i++){aw[i]=0;cb[i]=0;bw[i]=0;}
-    for(u32 i=0;i<ai;i++) aw[i]=(int)rd32(f);
-    for(u32 i=0;i<ai;i++) cb[i]=(int)rd32(f);
-    for(u32 i=0;i<ai;i++) bw[i]=(int)rd32(f);
-    static u32 comb[32*256*16];
-    fread(comb, 4, 32*256*16, f);
+    
+    SharedJob job = {};
+    job.start_nonce = start;
+    job.total_count = count;
+    job.next_offset = 0;
+    job.total_candidates = 0;
+    job.t_start = get_sec();
+    job.do_inst = getenv("INSTRUMENT")!=NULL;
+    job.blocks = getenv("BLOCKS")? atoi(getenv("BLOCKS")) : 0;
+    job.chunk_sz = getenv("CHUNK") ? strtoull(getenv("CHUNK"), NULL, 10) : 200000;
+    if (job.chunk_sz < 1000) job.chunk_sz = 200000;
+    
+    job.n_ops = n_ops;
+    job.tx0 = tx0;
+    job.tx1 = tx1;
+    job.base_pt = base_pt;
+    for(int i=0;i<25;i++) job.base_st[i]=rd64(f);
+    job.odd_u=rd32(f); job.k2=rd32(f); job.k2f0=rd32(f); job.ai=rd32(f); job.cbits=rd32(f);
+    
+    for(int i=0;i<402;i++){job.aw[i]=0;job.cb[i]=0;job.bw[i]=0;}
+    for(u32 i=0;i<job.ai;i++) job.aw[i]=(int)rd32(f);
+    for(u32 i=0;i<job.ai;i++) job.cb[i]=(int)rd32(f);
+    for(u32 i=0;i<job.ai;i++) job.bw[i]=(int)rd32(f);
+    
+    fread(job.comb, 4, 32*256*16, f);
     u64 probe=rd64(f); u32 pk1[8],pk2[8]; fread(pk1,4,8,f); fread(pk2,4,8,f);
     fclose(f);
-    printf("loaded: n_ops=%llu tx0=%llu tx1=%llu base_pt=%u ai=%u cbits=%u odd_u=%u k2=%u\n",
-        (unsigned long long)n_ops,(unsigned long long)tx0,(unsigned long long)tx1,base_pt,ai,cbits,odd_u,k2);
-
-    u32 Phost[8]={0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
-    cudaMemcpyToSymbol(d_P,Phost,32);
-    int iodd=odd_u,ik2=k2,ik2f0=k2f0,iai=ai,icb=cbits;
-    cudaMemcpyToSymbol(d_odd_u,&iodd,4); cudaMemcpyToSymbol(d_k2,&ik2,4);
-    cudaMemcpyToSymbol(d_k2f0,&ik2f0,4); cudaMemcpyToSymbol(d_active_iters,&iai,4);
-    cudaMemcpyToSymbol(d_compare_bits,&icb,4);
-    cudaMemcpyToSymbol(d_aw,aw,sizeof(aw)); cudaMemcpyToSymbol(d_cb,cb,sizeof(cb)); cudaMemcpyToSymbol(d_bw,bw,sizeof(bw));
-    cudaMemcpyToSymbol(d_base_st,base_st,200); cudaMemcpyToSymbol(d_base_pt,&base_pt,4);
-    u64 utx0=tx0,utx1=tx1; cudaMemcpyToSymbol(d_tx0,&utx0,8); cudaMemcpyToSymbol(d_tx1,&utx1,8);
-    u32* dcomb; cudaMalloc(&dcomb, sizeof(comb)); cudaMemcpy(dcomb,comb,sizeof(comb),cudaMemcpyHostToDevice);
-    cudaMemcpyToSymbol(d_comb,&dcomb,sizeof(dcomb));
+    
+    fprintf(stderr, "loaded: n_ops=%llu tx0=%llu tx1=%llu base_pt=%u ai=%u cbits=%u odd_u=%u k2=%u\n",
+        (unsigned long long)n_ops,(unsigned long long)tx0,(unsigned long long)tx1,base_pt,job.ai,job.cbits,job.odd_u,job.k2);
+    fflush(stderr);
 
     if(do_probe){
+        cudaSetDevice(0);
+        u32 Phost[8]={0xFFFFFC2F,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
+        cudaMemcpyToSymbol(d_P,Phost,32);
+        int iodd=job.odd_u,ik2=job.k2,ik2f0=job.k2f0,iai=job.ai,icb=job.cbits;
+        cudaMemcpyToSymbol(d_odd_u,&iodd,4); cudaMemcpyToSymbol(d_k2,&ik2,4);
+        cudaMemcpyToSymbol(d_k2f0,&ik2f0,4); cudaMemcpyToSymbol(d_active_iters,&iai,4);
+        cudaMemcpyToSymbol(d_compare_bits,&icb,4);
+        cudaMemcpyToSymbol(d_aw,job.aw,sizeof(job.aw)); cudaMemcpyToSymbol(d_cb,job.cb,sizeof(job.cb)); cudaMemcpyToSymbol(d_bw,job.bw,sizeof(job.bw));
+        cudaMemcpyToSymbol(d_base_st,job.base_st,200); cudaMemcpyToSymbol(d_base_pt,&job.base_pt,4);
+        u64 utx0=job.tx0,utx1=job.tx1; cudaMemcpyToSymbol(d_tx0,&utx0,8); cudaMemcpyToSymbol(d_tx1,&utx1,8);
+        u32* dcomb; cudaMalloc(&dcomb, sizeof(job.comb)); cudaMemcpy(dcomb,job.comb,sizeof(job.comb),cudaMemcpyHostToDevice);
+        cudaMemcpyToSymbol(d_comb,&dcomb,sizeof(dcomb));
+        
         u32* dout; cudaMalloc(&dout,16*4);
         probe_kernel3<<<1,1>>>(probe,dout);
         cudaError_t e=cudaDeviceSynchronize(); if(e){printf("probe err %s\n",cudaGetErrorString(e));return 1;}
         u32 h[16]; cudaMemcpy(h,dout,16*4,cudaMemcpyDeviceToHost);
         bool ok1=true,ok2=true; for(int i=0;i<8;i++){if(h[i]!=pk1[i])ok1=false; if(h[8+i]!=pk2[i])ok2=false;}
         printf("probe nonce=%llu k1:%s k2:%s\n",(unsigned long long)probe, ok1?"OK":"MISMATCH", ok2?"OK":"MISMATCH");
+        cudaFree(dcomb);
+        cudaFree(dout);
         return 0;
     }
 
-    u32* dcnt; cudaMalloc(&dcnt,4); cudaMemset(dcnt,0,4);
-    const int MAXOUT=4096; u64* dlist; cudaMalloc(&dlist,MAXOUT*8);
-    int blocks = getenv("BLOCKS")? atoi(getenv("BLOCKS")) : 72;
-    unsigned long long zero_counter = 0;
-    cudaMemcpyToSymbol(d_global_counter, &zero_counter, 8);
-    bool do_inst = getenv("INSTRUMENT")!=NULL;
-    RejCounters* d_rc=NULL; RejCounters h_rc={};
-    if(do_inst){
-        cudaMalloc(&d_rc, sizeof(RejCounters)); cudaMemset(d_rc,0,sizeof(RejCounters));
-        cudaMemcpyToSymbol(d_rej, &d_rc, sizeof(d_rc));
+    int num_devices = 0;
+    cudaError_t err = cudaGetDeviceCount(&num_devices);
+    if(err != cudaSuccess || num_devices <= 0) {
+        printf("No CUDA devices found or error: %s\n", cudaGetErrorString(err));
+        return 1;
     }
-    cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1); cudaEventRecord(t0);
-    search_kernel3<<<blocks,W>>>(start,count,dcnt,dlist,MAXOUT, do_inst?1:0);
-    cudaError_t e=cudaDeviceSynchronize(); if(e){printf("search err %s\n",cudaGetErrorString(e));return 1;}
-    cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);
-    u32 cnt; cudaMemcpy(&cnt,dcnt,4,cudaMemcpyDeviceToHost);
-    u64 list[MAXOUT]; cudaMemcpy(list,dlist,(cnt<MAXOUT?cnt:MAXOUT)*8,cudaMemcpyDeviceToHost);
-    for(u32 i=0;i<cnt && i<MAXOUT;i++) printf("CLEAN nonce=%llu\n",(unsigned long long)list[i]);
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_devices; i++) {
+        int physical_id = get_physical_gpu_id(i);
+        threads.push_back(std::thread(gpu_worker_thread, i, physical_id, &job));
+    }
+
+    for (auto& th : threads) {
+        if (th.joinable()) th.join();
+    }
+
+    double t_end = get_sec();
+    double total_elapsed = t_end - job.t_start;
+    u32 total_cnt = job.total_candidates.load();
+
     printf("scanned %llu in %.2fs (%llu nonce/s); clean=%d [kernel3 batch-inv x2 + addchain-inv]\n",
-        (unsigned long long)count, ms/1000.0, (u64)(count/(ms/1000.0)), cnt);
-    if(do_inst && d_rc){
-        cudaMemcpy(&h_rc, d_rc, sizeof(RejCounters), cudaMemcpyDeviceToHost);
-        u64 dx_tot = h_rc.dx_zero+h_rc.dx_noconv+h_rc.dx_width;
-        u64 c_tot  = h_rc.c_zero+h_rc.c_noconv+h_rc.c_width;
+        (unsigned long long)count, total_elapsed, total_elapsed > 0.01 ? (u64)(count/total_elapsed) : 0, total_cnt);
+    
+    if(job.do_inst){
+        u64 dx_tot = global_rc.dx_zero+global_rc.dx_noconv+global_rc.dx_width;
+        u64 c_tot  = global_rc.c_zero+global_rc.c_noconv+global_rc.c_width;
         u64 all_hard = dx_tot+c_tot;
         printf("\n=== Rejection Profile ===\n");
         printf("nonces: %llu launched, %llu clean (%.4f%%)\n",
-            (unsigned long long)h_rc.nonces_launched, (unsigned long long)h_rc.nonces_clean,
-            h_rc.nonces_launched ? 100.0*h_rc.nonces_clean/h_rc.nonces_launched : 0.0);
+            (unsigned long long)global_rc.nonces_launched, (unsigned long long)global_rc.nonces_clean,
+            global_rc.nonces_launched ? 100.0*global_rc.nonces_clean/global_rc.nonces_launched : 0.0);
         printf("hard: %llu (dx=%llu, c=%llu)\n", (unsigned long long)all_hard,
             (unsigned long long)dx_tot, (unsigned long long)c_tot);
         if(all_hard){
             printf("  dx: zero=%llu(%.1f%%) noconv=%llu(%.1f%%) width=%llu(%.1f%%)\n",
-                (unsigned long long)h_rc.dx_zero,  100.0*h_rc.dx_zero/all_hard,
-                (unsigned long long)h_rc.dx_noconv,100.0*h_rc.dx_noconv/all_hard,
-                (unsigned long long)h_rc.dx_width, 100.0*h_rc.dx_width/all_hard);
+                (unsigned long long)global_rc.dx_zero,  100.0*global_rc.dx_zero/all_hard,
+                (unsigned long long)global_rc.dx_noconv,100.0*global_rc.dx_noconv/all_hard,
+                (unsigned long long)global_rc.dx_width, 100.0*global_rc.dx_width/all_hard);
             printf("   c: zero=%llu(%.1f%%) noconv=%llu(%.1f%%) width=%llu(%.1f%%)\n",
-                (unsigned long long)h_rc.c_zero,  100.0*h_rc.c_zero/all_hard,
-                (unsigned long long)h_rc.c_noconv,100.0*h_rc.c_noconv/all_hard,
-                (unsigned long long)h_rc.c_width, 100.0*h_rc.c_width/all_hard);
+                (unsigned long long)global_rc.c_zero,  100.0*global_rc.c_zero/all_hard,
+                (unsigned long long)global_rc.c_noconv,100.0*global_rc.c_noconv/all_hard,
+                (unsigned long long)global_rc.c_width, 100.0*global_rc.c_width/all_hard);
         }
         printf("first rejection: dx=%llu c=%llu\n",
-            (unsigned long long)h_rc.first_dx, (unsigned long long)h_rc.first_c);
+            (unsigned long long)global_rc.first_dx, (unsigned long long)global_rc.first_c);
         printf("=========================\n");
     }
     return 0;

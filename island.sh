@@ -10,6 +10,7 @@
 #   ./island.sh build  [2|3]                            # compile CUDA kernel (2=original, 3=batch-inv)
 #   ./island.sh dump   CFG OUT.bin                      # gpu_state dump for a config
 #   ./island.sh search STATE START N [CHUNK]            # multi-GPU search -> CLEAN nonce=...
+#   ./island.sh dashboard STATE START N [CHUNK]         # TUI dashboard for search
 #   ./island.sh validate CFG NONCE...                  # quantum-confirm 0/0/0 + score
 #   ./island.sh bake   KEY VALUE [...]                  # CRLF-safe mod.rs edit + ecdsafail run
 #   ./island.sh hunt   CFG START N                      # measure -> dump -> search -> validate
@@ -64,7 +65,12 @@ rport(){ echo "$REMOTE_SSH" | grep -oE '\-p +[0-9]+' | grep -oE '[0-9]+'; }
 rkey(){ local k; k=$(echo "$REMOTE_SSH" | grep -oE '\-i +[^ ]+' | awk '{print $2}'); echo "${k/#\~/$HOME}"; }
 rsh(){ $REMOTE_SSH "$@"; }
 rcp(){ local p k; p="$(rport)"; k="$(rkey)"; scp ${p:+-P "$p"} ${k:+-i "$k"} -o StrictHostKeyChecking=no "$1" "$(rhost):$RDIR/$2" >/dev/null; }
-push_runtime(){ rsh "mkdir -p $RDIR"; rcp "$KSRC" "gpu_island.cu"; for s in build_kernel search_driver doctor; do rcp "$HERE/runtime/$s.sh" "$s.sh"; done; }
+push_runtime(){
+  rsh "mkdir -p $RDIR"
+  rcp "$KSRC" "gpu_island.cu"
+  for s in build_kernel search_driver doctor; do rcp "$HERE/runtime/$s.sh" "$s.sh"; done
+  rcp "$HERE/runtime/dashboard.py" "dashboard.py"
+}
 
 case "$cmd" in
 
@@ -114,6 +120,18 @@ search)
     need_remote; rcp "$STATE" state.bin
     rsh "GPU_ISLAND_BIN=\$HOME/$RDIR/gpu_island GPU_STATE_FILE=\$HOME/$RDIR/state.bin BLOCKS=$BLOCKS env $KENV \
          bash \$HOME/$RDIR/search_driver.sh $START $N $CHUNK $GPUS"
+  fi
+  ;;
+
+dashboard)
+  STATE="${1:?usage: dashboard STATE START N [CHUNK]}"; START="${2:?}"; N="${3:?}"; CHUNK="${4:-200000}"
+  if [ "$GPU" = local ]; then
+    [ -x "$KBIN" ] || die "run './island.sh build' first (kernel $KERNEL)"
+    python3 "$HERE/runtime/dashboard.py" "$STATE" "$START" "$N" "$CHUNK" "$GPUS"
+  else
+    need_remote; rcp "$STATE" state.bin; push_runtime >/dev/null 2>&1 || true
+    rsh -t "GPU_ISLAND_BIN=\$HOME/$RDIR/gpu_island GPU_STATE_FILE=\$HOME/$RDIR/state.bin BLOCKS=$BLOCKS env KERNEL3=1 GPUS=$GPUS \
+         python3 \$HOME/$RDIR/dashboard.py \$HOME/$RDIR/state.bin $START $N $CHUNK \$GPUS"
   fi
   ;;
 

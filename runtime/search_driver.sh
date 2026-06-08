@@ -15,23 +15,19 @@ KFLAG=""
 [ "${KERNEL3:-0}" = 1 ] && KFLAG="KERNEL3=1"
 [ "${KERNEL2:-0}" = 1 ] && KFLAG="KERNEL2=1"
 if [ "$NGPU" = auto ] || [ -z "$NGPU" ]; then
-  NGPU=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
-fi
-[ "${NGPU:-0}" -ge 1 ] 2>/dev/null || NGPU=1
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-per=$(( (COUNT + NGPU - 1) / NGPU ))
-for (( g=0; g<NGPU; g++ )); do
-  gstart=$(( START + g*per )); gcount=$per; end=$(( START + COUNT ))
-  (( gstart + gcount > end )) && gcount=$(( end - gstart ))
-  (( gcount <= 0 )) && continue
-  (
-    d=0
-    while [ "$d" -lt "$gcount" ]; do
-      c=$(( gcount-d < CHUNK ? gcount-d : CHUNK )); s=$(( gstart+d )); d=$(( d+CHUNK ))
-      env CUDA_VISIBLE_DEVICES="$g" GPU_STATE="$STATE" $KFLAG BLOCKS="$BLOCKS" \
-        "$BIN" "$s" "$c" 2>/dev/null | grep -oE "CLEAN nonce=[0-9]+" >> "$TMP/g$g"
+  unset CUDA_VISIBLE_DEVICES
+else
+  if [[ "$NGPU" =~ ^[0-9]+$ ]]; then
+    devs=""
+    for ((i=0; i<NGPU; i++)); do
+      devs="${devs}${devs:+,}$i"
     done
-  ) &
-done
-wait
-cat "$TMP"/g* 2>/dev/null | sort -u
+    export CUDA_VISIBLE_DEVICES="$devs"
+  else
+    export CUDA_VISIBLE_DEVICES="$NGPU"
+  fi
+fi
+
+env GPU_STATE="$STATE" $KFLAG BLOCKS="$BLOCKS" CHUNK="$CHUNK" \
+  "$BIN" "$START" "$COUNT" | grep -oE "CLEAN nonce=[0-9]+"
+
