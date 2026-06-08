@@ -630,11 +630,13 @@ void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list, int max_o
                 submod(ex, tx); submod(ex, ox);
                 u32 c[8]; submod_p(ox, ex, c);
                 
-                if(do_inst){
-                    int rej = check_gcd_factor_inst(c, 1);
-                    if(rej){ local_hard_flag = 1; atomicAdd((unsigned long long*)&d_rej->first_c, 1ULL); }
-                } else {
-                    if(!check_gcd_factor(c)) local_hard_flag = 1;
+                if (d_k2) {
+                    if(do_inst){
+                        int rej = check_gcd_factor_inst(c, 1);
+                        if(rej){ local_hard_flag = 1; atomicAdd((unsigned long long*)&d_rej->first_c, 1ULL); }
+                    } else {
+                        if(!check_gcd_factor(c)) local_hard_flag = 1;
+                    }
                 }
             }
             

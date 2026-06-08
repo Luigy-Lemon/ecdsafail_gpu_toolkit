@@ -383,7 +383,7 @@ __device__ bool nonce_is_clean(u64 nonce){
         u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
         u32 dx[8],c[8]; submod_p(tx,ox,dx); submod_p(ox,ex,c);
         if(!check_gcd_factor(dx)) return false;
-        if(!check_gcd_factor(c)) return false;
+        if(d_k2 && !check_gcd_factor(c)) return false;
     }
     return true;
 }
@@ -414,7 +414,7 @@ __device__ bool shot_is_hard(const u32 k1[8], const u32 k2[8]){
     u32 ex[8]; sqrmod(lambda,ex); submod(ex,tx); submod(ex,ox);
     u32 dx[8],c[8]; submod_p(tx,ox,dx); submod_p(ox,ex,c);
     if(!check_gcd_factor(dx)) return true;
-    if(!check_gcd_factor(c)) return true;
+    if(d_k2 && !check_gcd_factor(c)) return true;
     return false;
 }
 

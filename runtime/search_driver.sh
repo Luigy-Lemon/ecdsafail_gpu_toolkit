@@ -28,7 +28,7 @@ for (( g=0; g<NGPU; g++ )); do
     d=0
     while [ "$d" -lt "$gcount" ]; do
       c=$(( gcount-d < CHUNK ? gcount-d : CHUNK )); s=$(( gstart+d )); d=$(( d+CHUNK ))
-      CUDA_VISIBLE_DEVICES="$g" GPU_STATE="$STATE" $KFLAG BLOCKS="$BLOCKS" \
+      env CUDA_VISIBLE_DEVICES="$g" GPU_STATE="$STATE" $KFLAG BLOCKS="$BLOCKS" \
         "$BIN" "$s" "$c" 2>/dev/null | grep -oE "CLEAN nonce=[0-9]+" >> "$TMP/g$g"
     done
   ) &

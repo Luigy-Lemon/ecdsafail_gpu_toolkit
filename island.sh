@@ -155,7 +155,7 @@ hunt)
   ;;
 
 validate-port)
-  NONCE=$(grep -oP 'DIALOG_TAIL_NONCE.*?=\K[0-9]+' "$CHALLENGE/src/point_add/mod.rs" | head -1)
+  NONCE=$(grep -oP 'set_default_env\("DIALOG_TAIL_NONCE",\s*"\K[0-9]+' "$CHALLENGE/src/point_add/mod.rs" | head -1)
   [ -n "$NONCE" ] || die "can't read DIALOG_TAIL_NONCE from $CHALLENGE/src/point_add/mod.rs"
   echo ">> validating port against base nonce=$NONCE"
   STATE="$(mktemp).bin"; "$0" dump "" "$STATE" >/dev/null
