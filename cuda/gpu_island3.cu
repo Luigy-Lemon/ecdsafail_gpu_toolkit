@@ -77,11 +77,27 @@ __device__ __forceinline__ bool isZero(const u32 a[8]){ for(int i=0;i<8;i++) if(
 __device__ __forceinline__ bool eq(const u32 a[8], const u32 b[8]){ for(int i=0;i<8;i++) if(a[i]!=b[i]) return false; return true; }
 
 __device__ __constant__ u32 PM2[8]={0xFFFFFC2D,0xFFFFFFFE,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF,0xFFFFFFFF};
+
+// 2-bit fixed-window Fermat inverse: a^(p-2) mod p.
+// Precompute a^1, a^2, a^3 (3 × 8 u32 = 24 extra regs vs naive).
+// Scan 256-bit exponent in 2-bit windows: 128 windows × (2 sqr + 1 mul) + 3 precomp
+// = 256 sqr + 128 mul + 3 precomp = 387 mulmods (vs 505 naive = 23% saving).
+// p-2 has 249/256 bits set (97.3%), so the window method is near-optimal here.
 __device__ void invmod(const u32 a[8], u32 out[8]){
-    u32 r[8]={1,0,0,0,0,0,0,0}; u32 base[8]; cpy(base,a);
-    for(int i=0;i<256;i++){
-        if((PM2[i>>5]>>(i&31))&1){ u32 t[8]; mulmod(r,base,t); cpy(r,t); }
-        u32 t[8]; sqrmod(base,t); cpy(base,t);
+    u32 t0[8]; cpy(t0,a);                    // t0 = a^1
+    u32 t1[8]; sqrmod(t0,t1);                // t1 = a^2
+    u32 t2[8]; mulmod(t0,t1,t2);             // t2 = a^3
+    u32 r[8]={1,0,0,0,0,0,0,0};
+    // Process exponent MSB-first in 2-bit windows (128 windows)
+    // Window index 0 = bits 255:254, window 1 = bits 253:252, etc.
+    for(int wi=127; wi>=0; wi--){
+        int bit1 = (wi*2+1);
+        int bit0 = (wi*2);
+        u32 w = ((PM2[bit1>>5]>>(bit1&31))&1u)<<1 | ((PM2[bit0>>5]>>(bit0&31))&1u);
+        u32 tmp[8]; sqrmod(r,tmp); sqrmod(tmp,r);
+        if(w==1){ mulmod(r,t0,tmp); cpy(r,tmp); }
+        else if(w==2){ mulmod(r,t1,tmp); cpy(r,tmp); }
+        else if(w==3){ mulmod(r,t2,tmp); cpy(r,tmp); }
     }
     cpy(out,r);
 }
@@ -214,6 +230,40 @@ __device__ bool check_gcd_factor(const u32 factor[8]){
     return true;
 }
 
+// ===== Rejection instrumentation =====
+// 10 atomic u64 counters in global memory, toggled by INSTRUMENT=1 env var.
+// Overhead: ~1 atomicAdd per rejected nonce (hard_flag kills the block).
+struct RejCounters {
+    u64 dx_zero, dx_noconv, dx_width;
+    u64 c_zero, c_noconv, c_width;
+    u64 nonces_launched, nonces_clean;
+    u64 first_dx, first_c;
+};
+__device__ __constant__ RejCounters* d_rej;
+
+// Returns 0 if clean, rejection category 1-6 if hard.
+// factor_id: 0=dx, 1=c.  category: +1=zero, +2=noconv, +3=width.
+__device__ int check_gcd_factor_inst(const u32 factor[8], int factor_id){
+    unsigned long long* base = (unsigned long long*)&d_rej->dx_zero + factor_id*3;
+    if(isZero(factor)){
+        atomicAdd(base+0, 1ULL);
+        return factor_id*3+1;
+    }
+    int steps=full_gcd_steps_until_zero(d_P,factor,d_active_iters+1);
+    if(steps>d_active_iters){
+        atomicAdd(base+1, 1ULL);
+        return factor_id*3+2;
+    }
+    u32 u[8],v[8]; cpy(u,d_P); cpy(v,factor);
+    for(int step=0;step<d_active_iters;step++){
+        if(truncated_gcd_step(u,v,step)){
+            atomicAdd(base+2, 1ULL);
+            return factor_id*3+3;
+        }
+    }
+    return 0;
+}
+
 __device__ u32* d_comb;
 __device__ __forceinline__ const u32* comb_x(int j,int d){ return &d_comb[((j*256+d)*16)]; }
 __device__ __forceinline__ const u32* comb_y(int j,int d){ return &d_comb[((j*256+d)*16)+8]; }
@@ -279,7 +329,7 @@ __device__ void batch_inv(u32 vals[][8], u32 pf[][8], u32 orig[][8], int N, int 
 
 #define W 128
 
-__global__ void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list, int max_out){
+__global__ void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list, int max_out, int do_inst){
     __shared__ u64 sq_st[25];          // 200 B
     __shared__ int sq_pt;              // 4 B
     __shared__ unsigned char wbytes[W*64]; // 8192 B
@@ -305,6 +355,7 @@ __global__ void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list
             sq_pt=0; hard_flag=0;
         }
         __syncthreads();
+        if(t==0 && do_inst) atomicAdd((unsigned long long*)&d_rej->nonces_launched, 1ULL);
 
         for(int base_shot=0; base_shot<9024; base_shot+=W){
             if(hard_flag) break;
@@ -457,13 +508,24 @@ __global__ void search_kernel3(u64 start, u64 count, u32* out_cnt, u64* out_list
                 u32 dx[8]; submod_p(s_a[t], s_jxy[t], dx);
                 u32 c[8];  submod_p(s_jxy[t], ex, c);
 
-                if(!check_gcd_factor(dx) || !check_gcd_factor(c))
-                    hard_flag = 1;
+                if(do_inst){
+                    int rej = check_gcd_factor_inst(dx, 0);
+                    if(!rej) rej = check_gcd_factor_inst(c, 1);
+                    if(rej){
+                        hard_flag = 1;
+                        if(rej <= 3) atomicAdd((unsigned long long*)&d_rej->first_dx, 1ULL);
+                        else         atomicAdd((unsigned long long*)&d_rej->first_c, 1ULL);
+                    }
+                } else {
+                    if(!check_gcd_factor(dx) || !check_gcd_factor(c))
+                        hard_flag = 1;
+                }
             }
             __syncthreads();
         }
 
         if(t==0 && !hard_flag){
+            if(do_inst) atomicAdd((unsigned long long*)&d_rej->nonces_clean, 1ULL);
             u32 pos=atomicAdd(out_cnt,1u);
             if(pos<(u32)max_out) out_list[pos]=nonce;
         }
@@ -538,14 +600,45 @@ int main(int argc, char** argv){
     u32* dcnt; cudaMalloc(&dcnt,4); cudaMemset(dcnt,0,4);
     const int MAXOUT=4096; u64* dlist; cudaMalloc(&dlist,MAXOUT*8);
     int blocks = getenv("BLOCKS")? atoi(getenv("BLOCKS")) : 512;
+    bool do_inst = getenv("INSTRUMENT")!=NULL;
+    RejCounters* d_rc=NULL; RejCounters h_rc={};
+    if(do_inst){
+        cudaMalloc(&d_rc, sizeof(RejCounters)); cudaMemset(d_rc,0,sizeof(RejCounters));
+        cudaMemcpyToSymbol(d_rej, &d_rc, sizeof(d_rc));
+    }
     cudaEvent_t t0,t1; cudaEventCreate(&t0); cudaEventCreate(&t1); cudaEventRecord(t0);
-    search_kernel3<<<blocks,W>>>(start,count,dcnt,dlist,MAXOUT);
+    search_kernel3<<<blocks,W>>>(start,count,dcnt,dlist,MAXOUT, do_inst?1:0);
     cudaError_t e=cudaDeviceSynchronize(); if(e){printf("search err %s\n",cudaGetErrorString(e));return 1;}
     cudaEventRecord(t1); cudaEventSynchronize(t1); float ms=0; cudaEventElapsedTime(&ms,t0,t1);
     u32 cnt; cudaMemcpy(&cnt,dcnt,4,cudaMemcpyDeviceToHost);
     u64 list[MAXOUT]; cudaMemcpy(list,dlist,(cnt<MAXOUT?cnt:MAXOUT)*8,cudaMemcpyDeviceToHost);
     for(u32 i=0;i<cnt && i<MAXOUT;i++) printf("CLEAN nonce=%llu\n",(unsigned long long)list[i]);
-    printf("scanned %llu in %.2fs (%.0f nonce/s); clean=%u [kernel3 batch-inv x3]\n",
+    printf("scanned %llu in %.2fs (%.0f nonce/s); clean=%u [kernel3 batch-inv x3 + 2bit-win]\n",
         (unsigned long long)count, ms/1000.0, count/(ms/1000.0), cnt);
+    if(do_inst && d_rc){
+        cudaMemcpy(&h_rc, d_rc, sizeof(RejCounters), cudaMemcpyDeviceToHost);
+        u64 dx_tot = h_rc.dx_zero+h_rc.dx_noconv+h_rc.dx_width;
+        u64 c_tot  = h_rc.c_zero+h_rc.c_noconv+h_rc.c_width;
+        u64 all_hard = dx_tot+c_tot;
+        printf("\n=== Rejection Profile ===\n");
+        printf("nonces: %llu launched, %llu clean (%.4f%%)\n",
+            (unsigned long long)h_rc.nonces_launched, (unsigned long long)h_rc.nonces_clean,
+            h_rc.nonces_launched ? 100.0*h_rc.nonces_clean/h_rc.nonces_launched : 0.0);
+        printf("hard: %llu (dx=%llu, c=%llu)\n", (unsigned long long)all_hard,
+            (unsigned long long)dx_tot, (unsigned long long)c_tot);
+        if(all_hard){
+            printf("  dx: zero=%llu(%.1f%%) noconv=%llu(%.1f%%) width=%llu(%.1f%%)\n",
+                (unsigned long long)h_rc.dx_zero,  100.0*h_rc.dx_zero/all_hard,
+                (unsigned long long)h_rc.dx_noconv,100.0*h_rc.dx_noconv/all_hard,
+                (unsigned long long)h_rc.dx_width, 100.0*h_rc.dx_width/all_hard);
+            printf("   c: zero=%llu(%.1f%%) noconv=%llu(%.1f%%) width=%llu(%.1f%%)\n",
+                (unsigned long long)h_rc.c_zero,  100.0*h_rc.c_zero/all_hard,
+                (unsigned long long)h_rc.c_noconv,100.0*h_rc.c_noconv/all_hard,
+                (unsigned long long)h_rc.c_width, 100.0*h_rc.c_width/all_hard);
+        }
+        printf("first rejection: dx=%llu c=%llu\n",
+            (unsigned long long)h_rc.first_dx, (unsigned long long)h_rc.first_c);
+        printf("=========================\n");
+    }
     return 0;
 }
